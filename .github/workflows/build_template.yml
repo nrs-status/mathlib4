@@ -115,6 +115,19 @@ jobs:
         with:
           ref: ${{ inputs.mathlib_ci_ref }}
 
+      # Compute the trust-classified container target and read fallback
+      # for this job. Sets MATHLIB_CACHE_FROM / MATHLIB_CACHE_PRIMARY in
+      # env so every subsequent `cache get` in this job inherits them
+      # without per-call flag plumbing. Loaded from master via the sparse
+      # `workflow-actions/` checkout above, not from the PR branch — this
+      # keeps the trust policy out of fork-controllable file paths.
+      - name: Compute cache trust dispatch
+        uses: ./workflow-actions/.github/actions/cache-trust-dispatch
+        with:
+          repo: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
+          branch: ${{ github.head_ref || github.ref_name }}
+          head-sha: ${{ github.event.pull_request.head.sha || github.sha }}
+
       # Checkout the PR branch into a subdirectory
       - name: Checkout PR branch
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
@@ -633,6 +646,17 @@ jobs:
           ref: ${{ inputs.tools_branch_ref != '' && inputs.tools_branch_ref || (github.repository == 'leanprover-community/mathlib4-nightly-testing' && 'nightly-testing-green' || 'master') }}
           fetch-depth: 1
 
+      # Same trust dispatch as in the `build` and `post_steps` jobs. Loaded
+      # from the tools-branch checkout above (master), which is what the
+      # OIDC token's container scoping is keyed to — so a fork PR cannot
+      # influence which container this job is authorized to write.
+      - name: Compute cache trust dispatch
+        uses: ./.github/actions/cache-trust-dispatch
+        with:
+          repo: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
+          branch: ${{ github.head_ref || github.ref_name }}
+          head-sha: ${{ github.event.pull_request.head.sha || github.sha }}
+
       - name: Configure Lean
         uses: leanprover/lean-action@38fbc41a8c28c4cbaec22d7f7de508ec2e7c0dd9 # v1.5.0
         with:
@@ -689,9 +713,24 @@ jobs:
 
       - name: Upload staged cache to Azure
         shell: bash
+        env:
+          REPO: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
         run: |
-          echo "Uploading cache to Azure..."
-          MATHLIB_CACHE_USE_CLOUDFLARE=0 lake env "$CACHE_BIN" put-staged --staging-dir="cache-staging" --repo=${{ github.event.pull_request.head.repo.full_name || github.repository }}
+          # $MATHLIB_CACHE_PRIMARY is set by the `Compute cache trust dispatch`
+          # step above, from the shared composite action that owns the (repo,
+          # branch) → container mapping for both this job and the read-side
+          # jobs (build, post_steps).
+          echo "Uploading cache to Azure (container: $MATHLIB_CACHE_PRIMARY)..."
+          lake env "$CACHE_BIN" put-staged --container="$MATHLIB_CACHE_PRIMARY" --staging-dir="cache-staging" --repo="$REPO"
+
+          # Dual-write to the legacy `mathlib4` container, but only from master
+          # CI: older cache tools read from `legacy`, so master keeps it fresh
+          # for them. Forks and nightly never write to `legacy`, which keeps
+          # low-trust artifacts out of the container those older readers trust.
+          if [ "$MATHLIB_CACHE_PRIMARY" = "master" ]; then
+            echo "Dual-writing to legacy container for backward compatibility (master only)..."
+            lake env "$CACHE_BIN" put-staged --container=legacy --staging-dir="cache-staging" --repo="$REPO"
+          fi
 
   post_steps:
     name: Post-Build Step
@@ -709,6 +748,30 @@ jobs:
           ref: ${{ inputs.pr_branch_ref }}
           # Untrusted (potentially fork) checkout: don't persist the GITHUB_TOKEN into its .git/config.
           persist-credentials: false
+
+      # Sparse-checkout master's `.github/actions/` so the trust dispatch
+      # below loads from a trust-rooted source, not from PR-branch-controlled
+      # content. Mirrors the `Checkout local actions` step in the `build` job.
+      - name: Checkout local actions
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ github.workflow_sha }}
+          fetch-depth: 1
+          sparse-checkout: .github/actions
+          path: workflow-actions
+
+      # Sets MATHLIB_CACHE_FROM in env so the `cache get` calls below pick
+      # up the trust-class-appropriate read fallback automatically. Replaces
+      # the previous test-only `--cache-from=master,forks` hardcode that
+      # lived in this file — that policy is now in the shared composite
+      # action so build, upload_cache, and post_steps all consult the same
+      # source of truth.
+      - name: Compute cache trust dispatch
+        uses: ./workflow-actions/.github/actions/cache-trust-dispatch
+        with:
+          repo: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
+          branch: ${{ github.head_ref || github.ref_name }}
+          head-sha: ${{ github.event.pull_request.head.sha || github.sha }}
 
       - name: Configure Lean
         uses: leanprover/lean-action@38fbc41a8c28c4cbaec22d7f7de508ec2e7c0dd9 # v1.5.0
